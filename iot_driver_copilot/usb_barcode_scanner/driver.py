@@ -1,14 +1,15 @@
 import os
+import sys
 import threading
-import queue
 import time
+import http.server
 import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-try:
-    import hid
-except ImportError:
-    hid = None
+# Configuration from environment variables
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+HID_DEVICE_PATH = os.environ.get("HID_DEVICE_PATH", "/dev/hidraw0")
+BARCODE_MAX_LENGTH = int(os.environ.get("BARCODE_MAX_LENGTH", "128"))
 
 DEVICE_INFO = {
     "device_name": "USB Barcode Scanner",
@@ -18,113 +19,124 @@ DEVICE_INFO = {
     "connection_protocol": "USB HID (Keyboard Emulation)"
 }
 
-HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
-HID_VENDOR_ID = int(os.environ.get("HID_VENDOR_ID", "0x0c2e"), 16)
-HID_PRODUCT_ID = int(os.environ.get("HID_PRODUCT_ID", "0x1488"), 16)
+class BarcodeScanner:
+    def __init__(self, hid_device_path, barcode_max_length):
+        self.hid_device_path = hid_device_path
+        self.barcode_max_length = barcode_max_length
+        self.last_barcode = ""
+        self.lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._read_hid_loop, daemon=True)
+        self.thread.start()
 
-SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT", "10"))
+    def stop(self):
+        self._stop_event.set()
+        self.thread.join()
 
-scans_queue = queue.Queue(maxsize=10)
-last_scan_time = 0
-last_scan = ""
+    def get_last_barcode(self):
+        with self.lock:
+            return self.last_barcode
 
-KEYMAP = {
-    4: 'a', 5: 'b', 6: 'c', 7: 'd', 8: 'e', 9: 'f', 10: 'g', 11: 'h', 12: 'i', 13: 'j',
-    14: 'k', 15: 'l', 16: 'm', 17: 'n', 18: 'o', 19: 'p', 20: 'q', 21: 'r', 22: 's', 23: 't',
-    24: 'u', 25: 'v', 26: 'w', 27: 'x', 28: 'y', 29: 'z',
-    30: '1', 31: '2', 32: '3', 33: '4', 34: '5', 35: '6', 36: '7', 37: '8', 38: '9', 39: '0',
-    40: '\n', 44: ' ', 45: '-', 46: '=', 47: '[', 48: ']', 49: '\\', 51: ';', 52: "'", 53: '`',
-    54: ',', 55: '.', 56: '/',
-    # Shifted chars
-    (30, True): '!', (31, True): '@', (32, True): '#', (33, True): '$', (34, True): '%', (35, True): '^',
-    (36, True): '&', (37, True): '*', (38, True): '(', (39, True): ')',
-    (45, True): '_', (46, True): '+', (47, True): '{', (48, True): '}', (49, True): '|',
-    (51, True): ':', (52, True): '"', (53, True): '~', (54, True): '<', (55, True): '>', (56, True): '?'
-}
+    # HID keycode to ASCII (US keyboard, HID report format: [modifier, 0, key1, key2, ...])
+    # Only maps 0-9, a-z, A-Z, and Enter (as scan end). Extend as needed.
+    KEYCODE_MAP = {
+        0x04: 'a', 0x05: 'b', 0x06: 'c', 0x07: 'd', 0x08: 'e', 0x09: 'f', 0x0a: 'g', 0x0b: 'h', 0x0c: 'i', 0x0d: 'j',
+        0x0e: 'k', 0x0f: 'l', 0x10: 'm', 0x11: 'n', 0x12: 'o', 0x13: 'p', 0x14: 'q', 0x15: 'r', 0x16: 's', 0x17: 't',
+        0x18: 'u', 0x19: 'v', 0x1a: 'w', 0x1b: 'x', 0x1c: 'y', 0x1d: 'z',
+        0x1e: '1', 0x1f: '2', 0x20: '3', 0x21: '4', 0x22: '5', 0x23: '6', 0x24: '7', 0x25: '8', 0x26: '9', 0x27: '0',
+        0x28: '\n',
+    }
+    SHIFT_MAP = {
+        0x04: 'A', 0x05: 'B', 0x06: 'C', 0x07: 'D', 0x08: 'E', 0x09: 'F', 0x0a: 'G', 0x0b: 'H', 0x0c: 'I', 0x0d: 'J',
+        0x0e: 'K', 0x0f: 'L', 0x10: 'M', 0x11: 'N', 0x12: 'O', 0x13: 'P', 0x14: 'Q', 0x15: 'R', 0x16: 'S', 0x17: 'T',
+        0x18: 'U', 0x19: 'V', 0x1a: 'W', 0x1b: 'X', 0x1c: 'Y', 0x1d: 'Z',
+        0x1e: '!', 0x1f: '@', 0x20: '#', 0x21: '$', 0x22: '%', 0x23: '^', 0x24: '&', 0x25: '*', 0x26: '(', 0x27: ')',
+        0x28: '\n',
+    }
 
-def decode_keys(data):
-    """Decodes HID report bytes to a string."""
-    result = ""
-    shift = (data[0] & 0x22) != 0
-    for code in data[2:]:
-        if code == 0:
-            continue
-        if code == 40:
-            result += '\n'
-            continue
-        if shift and (code, True) in KEYMAP:
-            result += KEYMAP[(code, True)]
-        elif code in KEYMAP:
-            val = KEYMAP[code]
-            if shift and 'a' <= val <= 'z':
-                val = val.upper()
-            result += val
-    return result
+    def _parse_hid_report(self, report):
+        """Parse HID report bytes to a string character (if any)"""
+        if len(report) < 3:
+            return None
+        modifier = report[0]
+        shift = modifier & 0x22  # left or right shift
+        keycode = report[2]
+        if keycode == 0:
+            return None
+        if shift:
+            return self.SHIFT_MAP.get(keycode)
+        else:
+            return self.KEYCODE_MAP.get(keycode)
 
-def hid_reader():
-    global last_scan_time, last_scan
-    if hid is None:
-        return
-    while True:
+    def _read_hid_loop(self):
+        barcode_chars = []
         try:
-            h = hid.device()
-            h.open(HID_VENDOR_ID, HID_PRODUCT_ID)
-            h.set_nonblocking(True)
-            buffer = ""
-            while True:
-                data = h.read(8, timeout=100)
-                if data:
-                    chars = decode_keys(data)
-                    if chars:
-                        buffer += chars
-                        if '\n' in chars:
-                            scan_val = buffer.strip()
-                            if scan_val:
-                                last_scan = scan_val
-                                last_scan_time = time.time()
-                                try:
-                                    scans_queue.put(scan_val, timeout=0.2)
-                                except queue.Full:
-                                    pass
-                            buffer = ""
-                time.sleep(0.01)
-        except Exception:
-            time.sleep(2)
+            with open(self.hid_device_path, "rb") as f:
+                while not self._stop_event.is_set():
+                    report = f.read(8)
+                    if len(report) < 8:
+                        continue
+                    c = self._parse_hid_report(report)
+                    if c is None:
+                        continue
+                    if c == '\n':
+                        barcode = ''.join(barcode_chars)
+                        if barcode:
+                            with self.lock:
+                                self.last_barcode = barcode
+                        barcode_chars.clear()
+                    else:
+                        if len(barcode_chars) < self.barcode_max_length:
+                            barcode_chars.append(c)
+        except Exception as e:
+            # Device not present or error; clears last barcode and retries periodically
+            with self.lock:
+                self.last_barcode = ""
+            while not self._stop_event.is_set():
+                time.sleep(2)
+                try:
+                    with open(self.hid_device_path, "rb") as f:
+                        # If we can open, restart reading
+                        self._read_hid_loop()
+                except Exception:
+                    pass
 
-class DriverHandler(BaseHTTPRequestHandler):
+scanner = BarcodeScanner(HID_DEVICE_PATH, BARCODE_MAX_LENGTH)
+
+class BarcodeHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/info":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(DEVICE_INFO).encode("utf-8"))
+            self._json_response(200, DEVICE_INFO)
         elif self.path == "/scan":
-            scan = None
-            try:
-                scan = scans_queue.get(timeout=SCAN_TIMEOUT)
-            except queue.Empty:
-                # fallback: last scan if recent
-                if last_scan and time.time() - last_scan_time < SCAN_TIMEOUT:
-                    scan = last_scan
-            if scan:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(scan.encode("utf-8"))
-            else:
-                self.send_response(204)
-                self.end_headers()
+            barcode = scanner.get_last_barcode()
+            resp = {"barcode": barcode}
+            self._json_response(200, resp)
         else:
             self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
             self.end_headers()
+            self.wfile.write(b'{"error":"Not found"}')
 
-def main():
-    if hid:
-        t = threading.Thread(target=hid_reader, daemon=True)
-        t.start()
-    server = HTTPServer((HTTP_HOST, HTTP_PORT), DriverHandler)
-    server.serve_forever()
+    def log_message(self, format, *args):
+        return  # Suppress logging to stderr
+
+    def _json_response(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+def run_server():
+    server = http.server.ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), BarcodeHTTPRequestHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        scanner.stop()
+        server.server_close()
 
 if __name__ == "__main__":
-    main()
+    run_server()
