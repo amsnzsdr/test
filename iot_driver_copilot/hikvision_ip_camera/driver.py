@@ -1,190 +1,151 @@
 import os
 import io
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import socketserver
 import requests
+import http.server
+import socketserver
+from http import HTTPStatus
+import base64
 import socket
-import select
 
-# Environment Variables
+from urllib.parse import urlparse
+
+from queue import Queue
+
+import time
+
+import cv2
+import numpy as np
+
+# ========== Environment Variables ==========
+
 CAMERA_IP = os.environ.get("CAMERA_IP", "192.168.1.64")
 CAMERA_USER = os.environ.get("CAMERA_USER", "admin")
-CAMERA_PASS = os.environ.get("CAMERA_PASS", "12345")
+CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD", "")
 HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
 HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
-RTSP_SERVER_PORT = int(os.environ.get("RTSP_SERVER_PORT", "40554"))
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", CAMERA_USER)
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", CAMERA_PASS)
-RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "Streaming/Channels/101")
+CAMERA_HTTP_PORT = int(os.environ.get("CAMERA_HTTP_PORT", "80"))
+CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "40554"))
+RTSP_PATH = os.environ.get("CAMERA_RTSP_PATH", "/Streaming/Channels/101")
+# Acceptable values for RTSP_PATH: e.g. /Streaming/Channels/101
 
-SNAPSHOT_PATH = f"http://{CAMERA_IP}/ISAPI/Streaming/channels/101/picture"
+# ========== Helper Functions ==========
 
-def build_rtsp_url():
-    return f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{CAMERA_IP}:{RTSP_SERVER_PORT}/{RTSP_STREAM_PATH}"
+def get_snapshot():
+    url = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/ISAPI/Streaming/channels/101/picture"
+    auth = (CAMERA_USER, CAMERA_PASSWORD)
+    try:
+        response = requests.get(url, auth=auth, timeout=5)
+        if response.status_code == 200 and response.headers.get('Content-Type', '').startswith('image/'):
+            return response.content
+        else:
+            # Fallback: try another known snapshot endpoint
+            url2 = f"http://{CAMERA_IP}:{CAMERA_HTTP_PORT}/Streaming/channels/101/picture"
+            response2 = requests.get(url2, auth=auth, timeout=5)
+            if response2.status_code == 200 and response2.headers.get('Content-Type', '').startswith('image/'):
+                return response2.content
+            else:
+                return None
+    except requests.RequestException:
+        return None
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+def gen_mjpeg_stream(rtsp_url, stop_event):
+    # Use OpenCV to open the RTSP stream and yield JPEG frames in multipart/x-mixed-replace format.
+    # This allows direct browser viewing.
+    cap = cv2.VideoCapture(rtsp_url)
+    try:
+        if not cap.isOpened():
+            yield None
+            return
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            ret2, jpeg = cv2.imencode('.jpg', frame)
+            if not ret2:
+                continue
+            img_bytes = jpeg.tobytes()
+            yield img_bytes
+            time.sleep(0.04)  # ~25 FPS
+    finally:
+        cap.release()
 
-class CameraRequestHandler(BaseHTTPRequestHandler):
+def get_rtsp_url():
+    user = CAMERA_USER
+    password = CAMERA_PASSWORD
+    ip = CAMERA_IP
+    port = CAMERA_RTSP_PORT
+    path = RTSP_PATH
+    if user and password:
+        return f"rtsp://{user}:{password}@{ip}:{port}{path}"
+    else:
+        return f"rtsp://{ip}:{port}{path}"
+
+# ========== HTTP Handler ==========
+
+class CameraRequestHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "HikvisionProxy/1.0"
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):
         if self.path == "/snap":
-            self.handle_snapshot()
+            self.handle_snap()
         elif self.path == "/live":
-            self.handle_live_stream()
+            self.handle_live()
         else:
-            self.send_error(404, "Not Found")
+            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
-    def handle_snapshot(self):
-        try:
-            resp = requests.get(
-                SNAPSHOT_PATH,
-                auth=(CAMERA_USER, CAMERA_PASS),
-                timeout=10,
-                stream=True
-            )
-            if resp.status_code == 200 and resp.headers.get("Content-Type", "").lower().startswith("image/jpeg"):
-                self.send_response(200)
-                self.send_header("Content-type", "image/jpeg")
-                self.end_headers()
-                for chunk in resp.iter_content(chunk_size=8192):
-                    self.wfile.write(chunk)
-            else:
-                self.send_error(502, "Failed to fetch snapshot from camera")
-        except Exception as e:
-            self.send_error(502, f"Snapshot error: {str(e)}")
+    def handle_snap(self):
+        img_data = get_snapshot()
+        if img_data is None:
+            self.send_error(HTTPStatus.BAD_GATEWAY, "Failed to retrieve snapshot from camera")
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(img_data)))
+        self.end_headers()
+        self.wfile.write(img_data)
 
-    def handle_live_stream(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "video/mp2t")  # For browser compatibility; actual stream is proxied
-        self.send_header("Cache-Control", "no-cache")
+    def handle_live(self):
+        # Serve MJPEG stream converted from RTSP
+        rtsp_url = get_rtsp_url()
+        stop_event = threading.Event()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
         try:
-            with socket.create_connection((CAMERA_IP, RTSP_SERVER_PORT), timeout=10) as upstream:
-                # Start RTSP handshake with the camera
-                rtsp_url = build_rtsp_url()
-                client = RTSPClient(upstream, self.wfile, rtsp_url)
-                client.start_stream()
-        except Exception as e:
-            self.log_error("RTSP proxy error: %s", str(e))
-            try:
-                self.wfile.write(b"RTSP proxy error\n")
-            except:
-                pass
+            for frame in gen_mjpeg_stream(rtsp_url, stop_event):
+                if frame is None:
+                    break
+                self.wfile.write(b"--frame\r\n")
+                self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode('utf-8'))
+                self.wfile.write(frame)
+                self.wfile.write(b"\r\n")
+        except Exception:
+            pass
+        finally:
+            stop_event.set()
 
     def log_message(self, format, *args):
-        pass  # Silence default logging
+        return
 
-class RTSPClient:
-    def __init__(self, upstream_sock, out_stream, rtsp_url):
-        self.upstream_sock = upstream_sock
-        self.out_stream = out_stream
-        self.rtsp_url = rtsp_url
-        self.cseq = 1
-        self.session = None
-        self.transport = None
+# ========== Server ==========
 
-    def send_rtsp(self, cmd, extra_headers=None, body=None):
-        headers = [
-            f"{cmd} RTSP/1.0",
-            f"CSeq: {self.cseq}",
-        ]
-        if self.session:
-            headers.append(f"Session: {self.session}")
-        if extra_headers:
-            headers.extend(extra_headers)
-        headers.append("")
-        if body:
-            headers.append(body)
-        else:
-            headers.append("")
-        content = "\r\n".join(headers)
-        self.upstream_sock.sendall(content.encode("utf-8"))
-        self.cseq += 1
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
-    def recv_rtsp(self):
-        buf = b""
-        while b"\r\n\r\n" not in buf:
-            chunk = self.upstream_sock.recv(4096)
-            if not chunk:
-                raise Exception("RTSP server closed connection")
-            buf += chunk
-        header, rest = buf.split(b"\r\n\r\n", 1)
-        lines = header.decode().split("\r\n")
-        status_line = lines[0]
-        headers = {}
-        for line in lines[1:]:
-            if ':' in line:
-                k, v = line.split(":", 1)
-                headers[k.strip()] = v.strip()
-        return status_line, headers, rest
-
-    def start_stream(self):
-        # 1. OPTIONS
-        self.send_rtsp(f"OPTIONS {self.rtsp_url}")
-        self.recv_rtsp()
-        # 2. DESCRIBE
-        self.send_rtsp(f"DESCRIBE {self.rtsp_url}", ["Accept: application/sdp"])
-        _, describe_headers, describe_rest = self.recv_rtsp()
-        # 3. SETUP (interleaved over TCP)
-        track_id = self._find_track_id(describe_rest)
-        self.send_rtsp(
-            f"SETUP {self.rtsp_url}/{track_id}",
-            [f"Transport: RTP/AVP/TCP;unicast;interleaved=0-1"]
-        )
-        _, setup_headers, _ = self.recv_rtsp()
-        self.session = setup_headers.get("Session", "").split(";")[0]
-        # 4. PLAY
-        self.send_rtsp(f"PLAY {self.rtsp_url}/{track_id}", [])
-        self.recv_rtsp()
-        # 5. Proxy RTP over HTTP response
-        self.proxy_rtp_stream()
-
-    def _find_track_id(self, sdp_blob):
-        # Naive SDP parsing for trackID or trackID=1
-        sdp = sdp_blob.decode(errors="ignore")
-        for line in sdp.splitlines():
-            if line.startswith("a=control:"):
-                val = line[len("a=control:") :]
-                if val.startswith("rtsp://") or val.startswith("/"):
-                    return val.split("/")[-1]
-                else:
-                    return val
-        return "trackID=1"
-
-    def proxy_rtp_stream(self):
-        self.upstream_sock.setblocking(False)
-        while True:
-            rlist, _, _ = select.select([self.upstream_sock], [], [], 10)
-            if self.upstream_sock in rlist:
-                try:
-                    data = self.upstream_sock.recv(4096)
-                    if not data:
-                        break
-                    # RTP over RTSP TCP framing: $ <channel> <len-hi> <len-lo> <payload>
-                    # Proxy only RTP payload, skip the RTSP framing bytes
-                    ptr = 0
-                    while ptr < len(data):
-                        if data[ptr] == 0x24:  # $
-                            if ptr + 4 > len(data):
-                                break
-                            channel = data[ptr + 1]
-                            size = (data[ptr + 2] << 8) | data[ptr + 3]
-                            if ptr + 4 + size > len(data):
-                                break
-                            payload = data[ptr + 4 : ptr + 4 + size]
-                            self.out_stream.write(payload)
-                            self.out_stream.flush()
-                            ptr += 4 + size
-                        else:
-                            ptr += 1
-                except Exception:
-                    break
-
-def run_server():
-    server = ThreadedHTTPServer((HTTP_SERVER_HOST, HTTP_SERVER_PORT), CameraRequestHandler)
-    print(f"Camera driver HTTP server running at http://{HTTP_SERVER_HOST}:{HTTP_SERVER_PORT}")
-    server.serve_forever()
+def run():
+    server_address = (HTTP_SERVER_HOST, HTTP_SERVER_PORT)
+    httpd = ThreadingHTTPServer(server_address, CameraRequestHandler)
+    print(f"Serving on {HTTP_SERVER_HOST}:{HTTP_SERVER_PORT} (snap: /snap, live: /live)")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
 
 if __name__ == "__main__":
-    run_server()
+    run()
